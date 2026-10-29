@@ -1,0 +1,12 @@
+[Unit]
+Description=Raise the GPU clock floor while a MoE-offload llama.cpp process is running inference
+After=nvpmodel.service
+
+[Service]
+EnvironmentFile=-/etc/default/moe-gpu-stabilizer
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/moe-gpu-stabilizer
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

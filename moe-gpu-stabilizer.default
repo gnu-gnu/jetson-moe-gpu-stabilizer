@@ -1,0 +1,16 @@
+# /etc/default/moe-gpu-stabilizer — read by moe-gpu-stabilizer.service; restart the service after editing.
+
+# colon-separated paths or globs of libllama.so (or a statically linked llama binary) to trace
+#MOE_GPU_LIBS=/usr/local/lib/libllama.so:/home/*/llama.cpp*/build/bin/libllama.so:/home/*/src/llama.cpp*/build/bin/libllama.so
+
+# GPU clock floor while inference runs; 0 = highest available frequency
+#MOE_GPU_FLOOR_MHZ=0
+
+# seconds to keep the floor after the last decode call returns
+#MOE_GPU_HOLD_S=1.0
+
+# cmdline flags that mark a process as MoE offload
+#MOE_GPU_MOE_FLAGS=--cpu-moe,-cmoe,--n-cpu-moe,-ncmoe
+
+# GPU devfreq directory; empty = auto-detect
+#MOE_GPU_DEVFREQ=/sys/class/devfreq/17000000.gpu

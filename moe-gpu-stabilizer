@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Raise the Jetson GPU clock floor only while a MoE-offload llama.cpp process is running inference.
+
+Why: with --cpu-moe the GPU alternates with CPU expert work, so nvhost_podgov sees ~27% load and keeps
+the GPU at its minimum clock even though GPU time sits on the per-token critical path. Dense models keep
+the GPU busy and get the max clock from the governor anyway, so they are left alone.
+
+How: bpftrace uprobes on the decode entry points (FUNCS) in the libllama.so files matched by --libs
+report (pid, B|E). The server and llama-bench call llama_process (async; work may finish in
+llama_synchronize), older tools call llama_decode, so all three count as activity.
+A process counts as MoE offload when its cmdline has one of --moe-flags. The floor goes up on the first
+entry and back down --hold seconds after the last return. Only devfreq min_freq is written.
+"""
+import argparse, glob, os, select, signal, subprocess, sys, time
+
+DEFAULT_LIBS = ":".join([
+    "/usr/local/lib/libllama.so",
+    "/usr/lib/libllama.so",
+    "/home/*/llama.cpp*/build/bin/libllama.so",
+    "/home/*/src/llama.cpp*/build/bin/libllama.so",
+])
+DEFAULT_MOE_FLAGS = "--cpu-moe,-cmoe,--n-cpu-moe,-ncmoe"
+FUNCS = ("llama_decode", "llama_process", "llama_synchronize")
+RESCAN_S = 5.0      # re-attach when a library is rebuilt or appears (uprobes bind to the old inode)
+
+def log(msg):
+    print(msg, flush=True)
+
+def parse_args():
+    env = os.environ.get
+    p = argparse.ArgumentParser(description="Raise the Jetson GPU clock floor while llama.cpp MoE offload runs inference.")
+    p.add_argument("--libs", default=env("MOE_GPU_LIBS", DEFAULT_LIBS),
+                   help="colon-separated paths or globs of libllama.so (or a statically linked llama binary)")
+    p.add_argument("--devfreq", default=env("MOE_GPU_DEVFREQ", ""),
+                   help="GPU devfreq directory (default: auto-detect *.gpu under /sys/class/devfreq)")
+    p.add_argument("--floor-mhz", type=int, default=int(env("MOE_GPU_FLOOR_MHZ", "0")),
+                   help="floor while active; 0 = highest available frequency")
+    p.add_argument("--hold", type=float, default=float(env("MOE_GPU_HOLD_S", "1.0")),
+                   help="seconds to keep the floor after the last return (decode is ~0.3 s/token)")
+    p.add_argument("--moe-flags", default=env("MOE_GPU_MOE_FLAGS", DEFAULT_MOE_FLAGS),
+                   help="comma-separated cmdline flags that mark a MoE-offload process")
+    p.add_argument("--check", action="store_true",
+                   help="print the resolved devfreq, frequencies and libraries, then exit (no root needed)")
+    return p.parse_args()
+
+def find_devfreq(arg):
+    if arg:
+        return arg
+    cands = sorted(glob.glob("/sys/class/devfreq/*.gpu")) or sorted(glob.glob("/sys/class/devfreq/*gpu*"))
+    if not cands:
+        sys.exit("no GPU devfreq device found under /sys/class/devfreq; pass --devfreq")
+    return cands[0]
+
+def read_freqs(devfreq):
+    with open(f"{devfreq}/available_frequencies") as f:
+        return sorted(int(x) for x in f.read().split())
+
+def set_floor(devfreq, hz):
+    with open(f"{devfreq}/min_freq", "w") as f:
+        f.write(str(hz))
+
+def is_moe(pid, cache, flags):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            start = f.read().rsplit(")", 1)[1].split()[19]  # field 22: starttime, guards against pid reuse
+        key = (pid, start)
+        if key not in cache:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+            cache[key] = any(a.decode(errors="replace") in flags for a in args)
+        return cache[key]
+    except (OSError, IndexError):
+        return False
+
+def lib_ids(patterns):
+    ids = {}
+    for pat in patterns:
+        for p in sorted(glob.glob(pat)):
+            try:
+                st = os.stat(p)
+                ids[os.path.realpath(p)] = (st.st_ino, st.st_mtime_ns)
+            except OSError:
+                pass
+    return ids
+
+def start_tracer(libs):
+    probes = []
+    for p in libs:
+        for fn in FUNCS:
+            probes.append(f'uprobe:{p}:{fn} {{ printf("B %d\\n", pid); }}')
+            probes.append(f'uretprobe:{p}:{fn} {{ printf("E %d\\n", pid); }}')
+    # unbuffered bytes: select() only sees data still in the pipe, not data already in a Python buffer
+    return subprocess.Popen(["bpftrace", "-B", "line", "-e", "\n".join(probes)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+
+def main():
+    args = parse_args()
+    patterns = [p for p in args.libs.split(":") if p]
+    flags = tuple(f for f in args.moe_flags.split(",") if f)
+    devfreq = find_devfreq(args.devfreq)
+    freqs = read_freqs(devfreq)
+    lo = freqs[0]
+    hi = freqs[-1]
+    if args.floor_mhz > 0:
+        # the highest available step not above the requested floor
+        hi = max([f for f in freqs if f <= args.floor_mhz * 1000000] or [lo])
+
+    if args.check:
+        log(f"devfreq   {devfreq} (governor {open(devfreq + '/governor').read().strip()})")
+        log(f"available {', '.join(str(f // 1000000) for f in freqs)} MHz")
+        log(f"floor     idle {lo // 1000000} MHz, active {hi // 1000000} MHz, hold {args.hold} s")
+        log(f"moe flags {', '.join(flags)}")
+        libs = lib_ids(patterns)
+        log("libraries " + (", ".join(libs) if libs else "none found (set --libs / MOE_GPU_LIBS)"))
+        return
+
+    state = {"floor": None}
+    def apply(hz, why):
+        if state["floor"] != hz:
+            set_floor(devfreq, hz)
+            state["floor"] = hz
+            log(f"floor {hz // 1000000} MHz ({why})")
+    def stop(*_):
+        apply(lo, "exit")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    apply(lo, "start")
+
+    moe_cache, depth, last_end = {}, {}, 0.0
+    while True:
+        ids = lib_ids(patterns)
+        if not ids:
+            time.sleep(RESCAN_S)
+            continue
+        tr = start_tracer(list(ids))
+        log(f"tracing {', '.join(FUNCS)} in {', '.join(ids)}")
+        next_scan = time.monotonic() + RESCAN_S
+        pending = b""
+        while tr.poll() is None:
+            ready, _, _ = select.select([tr.stdout], [], [], 0.1)
+            now = time.monotonic()
+            lines = []
+            if ready:
+                chunk = os.read(tr.stdout.fileno(), 65536)
+                *lines, pending = (pending + chunk).split(b"\n")
+            for line in (l.decode(errors="replace") for l in lines):
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in ("B", "E") and parts[1].isdigit():
+                    pid = int(parts[1])
+                    if is_moe(pid, moe_cache, flags):
+                        if parts[0] == "B":
+                            depth[pid] = depth.get(pid, 0) + 1
+                            apply(hi, f"pid {pid} inference")
+                        else:
+                            depth[pid] = max(depth.get(pid, 1) - 1, 0)
+                            last_end = now
+                elif line.strip() and not line.startswith("Attaching"):
+                    log(f"bpftrace: {line.strip()}")
+            for pid in [p for p in depth if not os.path.exists(f"/proc/{p}")]:
+                del depth[pid]  # process died inside a traced call
+            if not any(depth.values()) and state["floor"] == hi and now - last_end > args.hold:
+                apply(lo, "idle")
+            if now > next_scan:
+                next_scan = now + RESCAN_S
+                if lib_ids(patterns) != ids:
+                    log("libllama.so set changed, re-attaching")
+                    tr.terminate()
+                    tr.wait()
+                    break
+        depth.clear()
+        apply(lo, "tracer restart")
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
